@@ -19,3 +19,4 @@ grandalf
 pypdf
 bs4
 langchain-text-splitters
+langchain_experimental
