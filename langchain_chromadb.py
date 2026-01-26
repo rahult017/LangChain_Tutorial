@@ -14,11 +14,11 @@ doc1 = Document(
         metadata={"team": "Royal Challengers Bangalore"}
     )
 doc2 = Document(
-        page_content="Rohit Sharma is the most successful captain in IPL history, leading Mumbai Indians to five titles. he's also a batsmen. He's known for his calm demeanor and ability to play big innings under pressure.",
+        page_content="Rohit Sharma is the most successful captain in IPL history, leading Mumbai Indians to five titles. He's also an aggressive opener batsman, known for his calm demeanor and ability to play big innings under pressure.",
         metadata={"team": "Mumbai Indians"}
     )
 doc3 = Document(
-        page_content="MS Dhoni, famously known as Captain Cool, has led Chennai Super Kings to multiple IPL titles. he's best finisher batsmen in world cricket. His finishing skills, wicketkeeping, and leadership are legendary.",
+        page_content="MS Dhoni, famously known as Captain Cool, has led Chennai Super Kings to multiple IPL titles. He's the best finisher batsman in world cricket — renowned for his ice-cool temperament, clutch performances, and ability to win games from hopeless situations. His finishing skills, wicketkeeping, and leadership are legendary.",
         metadata={"team": "Chennai Super Kings"}
     )
 doc4 = Document(
