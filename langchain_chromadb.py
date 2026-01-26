@@ -14,11 +14,11 @@ doc1 = Document(
         metadata={"team": "Royal Challengers Bangalore"}
     )
 doc2 = Document(
-        page_content="Rohit Sharma is the most successful captain in IPL history, leading Mumbai Indians to five titles. He's known for his calm demeanor and ability to play big innings under pressure.",
+        page_content="Rohit Sharma is the most successful captain in IPL history, leading Mumbai Indians to five titles. he's also a batsmen. He's known for his calm demeanor and ability to play big innings under pressure.",
         metadata={"team": "Mumbai Indians"}
     )
 doc3 = Document(
-        page_content="MS Dhoni, famously known as Captain Cool, has led Chennai Super Kings to multiple IPL titles. His finishing skills, wicketkeeping, and leadership are legendary.",
+        page_content="MS Dhoni, famously known as Captain Cool, has led Chennai Super Kings to multiple IPL titles. he's best finisher batsmen in world cricket. His finishing skills, wicketkeeping, and leadership are legendary.",
         metadata={"team": "Chennai Super Kings"}
     )
 doc4 = Document(
@@ -42,7 +42,7 @@ data = vector_store.get(include=['embeddings','documents', 'metadatas'])
 query = input("enter your query :-")
 output = vector_store.similarity_search(
     query=query,
-    k=2
+    k=3
 )
 print(output)
 team = input("enter your team name:-")
