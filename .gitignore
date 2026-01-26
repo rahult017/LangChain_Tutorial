@@ -3,3 +3,4 @@ __pypackages__/
 __pycache__/
 .env
 venv/
+my_chroma_db/

@@ -1,12 +1,15 @@
+openai
 langchain
 langchain-core
 langchain-openai
 langchain-community
-openai
 langchain-anthropic
 langchain-google-genai
-google-generativeai
+langchain-text-splitters
+langchain_experimental
 langchain-huggingface
+langchain-chroma
+google-generativeai
 transformers
 huggingface-hub
 python-dotenv
@@ -18,5 +21,5 @@ pydantic[email]
 grandalf
 pypdf
 bs4
-langchain-text-splitters
-langchain_experimental
+chromadb
+tiktoken
