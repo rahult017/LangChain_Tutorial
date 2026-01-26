@@ -41,10 +41,12 @@ vectorstore = Chroma.from_documents(
 # Step 4: Convert vectorstore into a retriever
 retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
 query = "What is Chroma used for?"
+# using invoke
 results = retriever.invoke(query)
-for i, doc in enumerate(results):
-    print(f"\n--- Result {i+1} ---")
-    print(doc.page_content)
+# for i, doc in enumerate(results):
+#     print(f"\n--- Result {i+1} ---")
+#     print(doc.page_content)
+
 results = vectorstore.similarity_search(query, k=2)
 for i, doc in enumerate(results):
     print(f"\n--- Result {i+1} ---")
