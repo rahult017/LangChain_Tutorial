@@ -84,7 +84,7 @@ st.set_page_config(
 )
 
 st.title("🎥 YouTube Video Q&A (RAG)")
-st.write("Ask questions or summarize any YouTube video using RAG.")
+st.write("Paste a YouTube URL to automatically summarize and ask questions!")
 
 # Initialize session state
 if "vectorstore" not in st.session_state:
@@ -93,89 +93,219 @@ if "video_processed" not in st.session_state:
     st.session_state.video_processed = False
 if "video_url" not in st.session_state:
     st.session_state.video_url = ""
+if "summary" not in st.session_state:
+    st.session_state.summary = ""
+if "processing" not in st.session_state:
+    st.session_state.processing = False
+if "last_processed_url" not in st.session_state:
+    st.session_state.last_processed_url = ""
 
-# Section 1: Video Processing
-st.header("1️⃣ Process Video")
+# YouTube URL Input
 video_url = st.text_input(
     "YouTube Video URL",
     placeholder="https://www.youtube.com/watch?v=Gfr50f6ZBvo",
     key="url_input",
 )
 
-process_button = st.button("Process Video", key="process_btn")
+# Auto-process when URL changes
+if video_url and video_url != st.session_state.last_processed_url:
+    if not st.session_state.processing:
+        st.session_state.processing = True
 
-if process_button:
-    if not video_url:
-        st.error("Please enter a YouTube URL.")
-        st.stop()
+        try:
+            video_id = extract_video_id(video_url)
+        except ValueError as e:
+            st.error(str(e))
+            st.session_state.processing = False
+            st.stop()
 
-    try:
-        video_id = extract_video_id(video_url)
-    except ValueError as e:
-        st.error(str(e))
-        st.stop()
+        # Create placeholders for progress
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-    with st.spinner("Fetching transcript..."):
-        transcript = get_youtube_transcript(video_id)
+        # Step 1: Fetch transcript
+        status_text.text("🔍 Fetching transcript...")
+        progress_bar.progress(20)
 
-    with st.spinner("Chunking & embedding transcript..."):
+        try:
+            transcript = get_youtube_transcript(video_id)
+            progress_bar.progress(40)
+        except Exception as e:
+            st.error(f"Failed to fetch transcript: {str(e)}")
+            st.session_state.processing = False
+            st.stop()
+
+        # Step 2: Chunking
+        status_text.text("📝 Chunking transcript...")
         docs = chunk_text(transcript)
+        progress_bar.progress(60)
+
+        # Step 3: Building embeddings
+        status_text.text("🧠 Building embeddings...")
         st.session_state.vectorstore = build_vectorstore(docs)
+        progress_bar.progress(80)
+
+        # Step 4: Generate initial summary
+        status_text.text("📊 Generating summary...")
+        summary = ask_question(
+            st.session_state.vectorstore,
+            "Provide a comprehensive summary of this video. Include the main topic, key points discussed, and important conclusions.",
+        )
+        progress_bar.progress(100)
+
+        # Store results in session state
+        st.session_state.summary = summary
         st.session_state.video_processed = True
         st.session_state.video_url = video_url
+        st.session_state.last_processed_url = video_url
+        st.session_state.processing = False
 
-    st.success("✅ Video processed successfully! You can now ask questions.")
+        # Clear progress indicators
+        status_text.empty()
+        progress_bar.empty()
 
-# Section 2: Question Asking (Only shown after video is processed)
-if st.session_state.video_processed:
-    st.header("2️⃣ Ask Questions")
+        st.rerun()
 
-    # Display the processed video URL
-    st.info(
-        f"📺 Processed Video: {st.session_state.video_url[:60]}..."
-        if len(st.session_state.video_url) > 60
-        else f"📺 Processed Video: {st.session_state.video_url}"
+# Display Summary if video is processed
+if st.session_state.video_processed and st.session_state.summary:
+    st.divider()
+
+    # Summary Section
+    with st.expander("📝 Video Summary", expanded=True):
+        st.write(st.session_state.summary)
+
+        # Quick action buttons for the summary
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("🔄 Regenerate Summary", key="regen_summary"):
+                with st.spinner("Regenerating summary..."):
+                    st.session_state.summary = ask_question(
+                        st.session_state.vectorstore,
+                        "Provide a comprehensive summary of this video. Include the main topic, key points discussed, and important conclusions.",
+                    )
+                st.rerun()
+
+        with col2:
+            if st.button("🎯 Key Takeaways", key="key_takeaways"):
+                with st.spinner("Extracting key takeaways..."):
+                    takeaways = ask_question(
+                        st.session_state.vectorstore,
+                        "List the top 5 key takeaways from this video in bullet points.",
+                    )
+                st.info(f"### 🎯 Key Takeaways\n{takeaways}")
+
+        with col3:
+            if st.button("⏱️ Timeline Summary", key="timeline"):
+                with st.spinner("Creating timeline..."):
+                    timeline = ask_question(
+                        st.session_state.vectorstore,
+                        "Create a chronological timeline of the main events or topics discussed in this video.",
+                    )
+                st.info(f"### ⏱️ Timeline\n{timeline}")
+
+    # Question & Prompt Section
+    st.divider()
+    st.header("💬 Ask Questions or Write a Prompt")
+    st.write("Ask anything about the video or provide a custom prompt for analysis!")
+
+    # Input method selection
+    input_type = st.radio(
+        "Choose input type:",
+        ["❓ Specific Question", "📝 Custom Prompt"],
+        horizontal=True,
+        key="input_type",
     )
 
-    question = st.text_input(
-        "Your Question",
-        placeholder="What is the main topic of this video?",
-        key="question_input",
-    )
+    if input_type == "❓ Specific Question":
+        user_input = st.text_area(
+            "Your Question",
+            placeholder="What is the main argument presented in this video?",
+            height=100,
+            key="question_area",
+        )
 
-    if question:
-        if st.button("Ask Question", key="ask_btn"):
-            with st.spinner("Thinking..."):
-                answer = ask_question(
-                    st.session_state.vectorstore,
-                    question,
-                )
+        if st.button("🔍 Get Answer", key="answer_btn", type="primary") and user_input:
+            with st.spinner("Analyzing video content..."):
+                answer = ask_question(st.session_state.vectorstore, user_input)
 
             st.markdown("### 💡 Answer")
             st.write(answer)
 
-# Section 3: Quick Actions (Only shown after video is processed)
-if st.session_state.video_processed:
-    st.divider()
-    st.markdown("### ⚡ Quick Actions")
+    else:  # Custom Prompt
+        # Prompt templates
+        st.caption("Quick prompt templates:")
+        prompt_templates = {
+            "Detailed Analysis": "Analyze this video in depth. Discuss the main arguments, supporting evidence, and overall effectiveness of the presentation.",
+            "Technical Explanation": "Explain the technical concepts discussed in this video in simple terms.",
+            "Counter Arguments": "What are potential counter-arguments to the main points presented in this video?",
+            "Expert Review": "Review this content as an expert in the field. What's accurate, what's missing, and what could be improved?",
+            "Custom": "",
+        }
 
-    col1, col2 = st.columns(2)
+        selected_template = st.selectbox(
+            "Choose a prompt template (optional):",
+            list(prompt_templates.keys()),
+            key="prompt_template",
+        )
+
+        custom_prompt = st.text_area(
+            "Your Custom Prompt",
+            value=prompt_templates[selected_template],
+            placeholder="Write your custom prompt here...",
+            height=120,
+            key="prompt_area",
+        )
+
+        if (
+            st.button("✨ Generate Response", key="prompt_btn", type="primary")
+            and custom_prompt
+        ):
+            with st.spinner("Processing your prompt..."):
+                response = ask_question(st.session_state.vectorstore, custom_prompt)
+
+            st.markdown("### 🎯 Response")
+            st.write(response)
+
+    # Additional Features Section
+    st.divider()
+    st.header("🔧 Additional Features")
+
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-        if st.button("📝 Summarize Video", key="summary_btn"):
-            with st.spinner("Summarizing..."):
-                summary = ask_question(
+        if st.button("📚 Key Topics", key="topics"):
+            with st.spinner("Identifying key topics..."):
+                topics = ask_question(
                     st.session_state.vectorstore,
-                    "Summarize the entire video in a concise way.",
+                    "List the main topics and subtopics discussed in this video. Group them hierarchically.",
                 )
-
-            st.markdown("### 📝 Summary")
-            st.write(summary)
+            st.info(f"### 📚 Key Topics\n{topics}")
 
     with col2:
-        if st.button("🗑️ Clear & Process New Video", key="clear_btn"):
+        if st.button("💭 Quotes", key="quotes"):
+            with st.spinner("Extracting important quotes..."):
+                quotes = ask_question(
+                    st.session_state.vectorstore,
+                    "Extract 5-7 notable quotes or statements from this video that capture its essence.",
+                )
+            st.info(f"### 💭 Notable Quotes\n{quotes}")
+
+    with col3:
+        if st.button("🗑️ Process New Video", key="clear_btn"):
             # Clear session state
-            for key in ["vectorstore", "video_processed", "video_url"]:
-                if key in st.session_state:
-                    del st.session_state[key]
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
             st.rerun()
+
+elif st.session_state.video_processed and not st.session_state.summary:
+    # Handle case where video is processed but no summary (shouldn't normally happen)
+    st.info("Processing video... Please wait.")
+
+elif not st.session_state.video_processed and video_url:
+    st.info("👆 Press Enter or click outside the input field to process the video.")
+
+# Footer
+st.divider()
+st.caption(
+    "Built with Streamlit, LangChain, and OpenAI • Automatically processes YouTube videos on URL input"
+)
