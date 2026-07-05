@@ -27,3 +27,5 @@ faiss-cpu
 wikipedia
 youtube-transcript-api
 ddgs
+yt-dlp
+openai-whisper
