@@ -8,7 +8,6 @@ enableCORS = false
 enableXsrfProtection = true
 enableWebsocketCompression = true
 fileWatcherType = "poll"
-maxMessageSize = 200
 
 [browser]
 gatherUsageStats = false
@@ -19,15 +18,10 @@ primaryColor = "#FF4B4B"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F0F2F6"
 textColor = "#262730"
-font = "sans serif"
 
 [logger]
 level = "info"
-messageFormat = "%(asctime)s %(levelname)s %(message)s"
 
 [client]
 showErrorDetails = false
 toolbarMode = "minimal"
-
-[runner]
-fastReruns = true
