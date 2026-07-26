@@ -12,6 +12,10 @@ import traceback
 import sys
 from typing import List, Optional, Dict, Any
 import os
+from logging.handlers import RotatingFileHandler
+import tempfile
+import subprocess
+import json
 
 load_dotenv()
 
@@ -21,7 +25,7 @@ load_dotenv()
 
 
 def setup_logger():
-    """Configure logging with both file and console handlers"""
+    """Configure logging with daily rotating file handler"""
     # Create logger
     logger = logging.getLogger("YouTubeRAG")
     logger.setLevel(logging.DEBUG)
@@ -35,18 +39,19 @@ def setup_logger():
     )
     console_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-    # File handler (detailed logging)
-    log_filename = f'youtube_rag_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-    file_handler = logging.FileHandler(log_filename)
+    # File handler with daily rotation
+    log_filename = f'youtube_rag_{datetime.now().strftime("%Y%m%d")}.log'
+    file_handler = RotatingFileHandler(
+        log_filename, maxBytes=10 * 1024 * 1024, backupCount=30
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(detailed_formatter)
 
-    # Console handler (info and above)
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(console_formatter)
 
-    # Add handlers
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
@@ -55,7 +60,6 @@ def setup_logger():
     return logger, log_filename
 
 
-# Initialize logger
 logger, LOG_FILENAME = setup_logger()
 
 # ------------------------
@@ -105,39 +109,29 @@ class YouTubeRAGException(Exception):
 
 
 class VideoIDExtractionError(YouTubeRAGException):
-    """Exception raised when video ID extraction fails"""
-
     def __init__(self, url: str, message: str = "Failed to extract video ID from URL"):
         self.url = url
         super().__init__(f"{message}: {url}", "INVALID_URL")
 
 
 class TranscriptFetchError(YouTubeRAGException):
-    """Exception raised when transcript fetching fails"""
-
     def __init__(self, video_id: str, message: str = "Failed to fetch transcript"):
         self.video_id = video_id
         super().__init__(f"{message} for video {video_id}", "TRANSCRIPT_ERROR")
 
 
 class EmbeddingError(YouTubeRAGException):
-    """Exception raised when embedding creation fails"""
-
     def __init__(self, message: str = "Failed to create embeddings"):
         super().__init__(message, "EMBEDDING_ERROR")
 
 
 class QueryError(YouTubeRAGException):
-    """Exception raised when querying fails"""
-
     def __init__(self, question: str, message: str = "Failed to process query"):
         self.question = question
         super().__init__(f"{message}: {question[:100]}", "QUERY_ERROR")
 
 
 class TranslationError(YouTubeRAGException):
-    """Exception raised when translation fails"""
-
     def __init__(self, message: str = "Failed to translate text"):
         super().__init__(message, "TRANSLATION_ERROR")
 
@@ -148,17 +142,13 @@ class TranslationError(YouTubeRAGException):
 
 
 class LoggerMixin:
-    """Mixin class to add logging capabilities to any class"""
-
     @property
     def logger(self):
-        """Get logger for the class"""
         if not hasattr(self, "_logger"):
             self._logger = logging.getLogger(self.__class__.__name__)
         return self._logger
 
     def log_error(self, error: Exception, context: Dict[str, Any] = None):
-        """Log error with context"""
         error_context = {
             "error_type": type(error).__name__,
             "error_message": str(error),
@@ -171,16 +161,247 @@ class LoggerMixin:
         self.logger.debug(f"Traceback: {traceback.format_exc()}")
 
     def log_info(self, message: str):
-        """Log info message"""
         self.logger.info(message)
 
     def log_debug(self, message: str):
-        """Log debug message"""
         self.logger.debug(message)
 
     def log_warning(self, message: str):
-        """Log warning message"""
         self.logger.warning(message)
+
+
+# ------------------------
+# Whisper-based Transcript Fetcher
+# ------------------------
+
+
+class WhisperTranscriptFetcher(LoggerMixin):
+    """Fetches transcripts using yt-dlp + Whisper"""
+
+    def __init__(self, languages: List[str] = None, model_size: str = "tiny"):
+        self.languages = languages or ["en", "hi"]
+        self.model_size = model_size
+        self._whisper_model = None
+
+    def _get_whisper_model(self):
+        """Lazy load Whisper model"""
+        if self._whisper_model is None:
+            try:
+                import whisper
+
+                self.log_info(f"Loading Whisper model: {self.model_size}")
+                self._whisper_model = whisper.load_model(self.model_size)
+                self.log_info("Whisper model loaded successfully")
+            except ImportError:
+                self.log_error(ImportError("Whisper not installed"), {})
+                raise YouTubeRAGException(
+                    "Whisper package not installed. Run: pip install openai-whisper",
+                    "WHISPER_NOT_INSTALLED",
+                )
+        return self._whisper_model
+
+    def fetch_transcript(self, video_id: str) -> tuple:
+        """Fetch transcript using yt-dlp and Whisper"""
+        context = {"video_id": video_id}
+
+        try:
+            self.log_info(f"Fetching transcript for video {video_id} using Whisper")
+
+            # Check if yt-dlp is installed
+            try:
+                import yt_dlp
+            except ImportError:
+                self.log_error(ImportError("yt-dlp not installed"), {})
+                raise YouTubeRAGException(
+                    "yt-dlp package not installed. Run: pip install yt-dlp",
+                    "YTDLP_NOT_INSTALLED",
+                )
+
+            # Create temporary directory for audio
+            with tempfile.TemporaryDirectory() as temp_dir:
+                audio_path = os.path.join(temp_dir, f"{video_id}.mp3")
+
+                # Download audio using yt-dlp
+                self.log_info("Downloading audio from YouTube...")
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }
+                    ],
+                    "outtmpl": os.path.join(temp_dir, f"{video_id}.%(ext)s"),
+                    "quiet": True,
+                    "no_warnings": True,
+                    "extract_flat": False,
+                }
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+
+                # The file might have a different name due to yt-dlp's naming
+                actual_audio_path = os.path.join(temp_dir, f"{video_id}.mp3")
+                if not os.path.exists(actual_audio_path):
+                    # Try to find the file
+                    files = os.listdir(temp_dir)
+                    for f in files:
+                        if f.endswith(".mp3"):
+                            actual_audio_path = os.path.join(temp_dir, f)
+                            break
+
+                if not os.path.exists(actual_audio_path):
+                    raise TranscriptFetchError(video_id, "Failed to download audio")
+
+                self.log_info(f"Audio downloaded: {actual_audio_path}")
+
+                # Transcribe with Whisper
+                self.log_info("Transcribing audio with Whisper...")
+                model = self._get_whisper_model()
+                result = model.transcribe(
+                    actual_audio_path, language="auto", task="transcribe", verbose=False
+                )
+
+                transcript_text = result["text"]
+                detected_language = result.get("language", "unknown")
+
+                self.log_info(
+                    f"Transcription complete. Language: {detected_language}, Length: {len(transcript_text)} characters"
+                )
+
+                return transcript_text, detected_language.capitalize()
+
+        except Exception as e:
+            self.log_error(e, context)
+            # Fallback to transcript API if Whisper fails
+            self.log_warning(
+                "Whisper transcription failed, falling back to transcript API..."
+            )
+            try:
+                return self._fallback_transcript_api(video_id)
+            except Exception as fallback_e:
+                self.log_error(fallback_e, context)
+                raise TranscriptFetchError(
+                    video_id, f"All transcript methods failed: {str(e)}"
+                )
+
+    def _fallback_transcript_api(self, video_id: str) -> tuple:
+        """Fallback to transcript API if Whisper fails"""
+        try:
+            self.log_info("Attempting transcript API fallback...")
+            api = YouTubeTranscriptApi()
+            transcript_list = api.list(video_id)
+
+            # Try to find transcript in preferred languages
+            try:
+                transcript = transcript_list.find_transcript(self.languages)
+            except:
+                available_langs = [t.language_code for t in transcript_list]
+                transcript = transcript_list.find_transcript(available_langs)
+
+            transcript_parts = transcript.fetch()
+            full_transcript = " ".join(chunk.text for chunk in transcript_parts)
+            language_code = transcript.language_code
+
+            language_name = self._get_language_name(language_code)
+
+            self.log_info(f"API fallback successful. Language: {language_name}")
+            return full_transcript, language_name
+
+        except Exception as e:
+            self.log_error(e, {"video_id": video_id})
+            raise TranscriptFetchError(video_id, f"API fallback failed: {str(e)}")
+
+    def _get_language_name(self, language_code: str) -> str:
+        """Convert language code to language name"""
+        for name, code in LANGUAGE_MAP.items():
+            if code == language_code:
+                return name.split(" ")[0]
+        return language_code.upper()
+
+
+# ------------------------
+# Hybrid Transcript Fetcher
+# ------------------------
+
+
+class HybridTranscriptFetcher(LoggerMixin):
+    """Tries multiple methods to fetch transcripts with failover"""
+
+    def __init__(
+        self, languages: List[str] = None, proxy_config: Dict[str, str] = None
+    ):
+        self.languages = languages or ["en", "hi"]
+        self.proxy_config = proxy_config
+        self.api_fetcher = None
+        self.whisper_fetcher = WhisperTranscriptFetcher(languages=languages)
+
+    def fetch_transcript(self, video_id: str) -> tuple:
+        """Try multiple methods to fetch transcript"""
+
+        methods = [
+            ("Whisper", self._fetch_with_whisper),
+            ("Transcript API (No Proxy)", self._fetch_with_api),
+            (
+                ("Transcript API (With Proxy)", self._fetch_with_api_proxy)
+                if self.proxy_config
+                else None
+            ),
+        ]
+
+        # Filter out None methods
+        methods = [m for m in methods if m is not None]
+
+        for method_name, method in methods:
+            try:
+                self.log_info(f"Attempting to fetch transcript using: {method_name}")
+                result = method(video_id)
+                self.log_info(f"Successfully fetched transcript using: {method_name}")
+                return result
+            except Exception as e:
+                self.log_warning(f"{method_name} failed: {str(e)}")
+                continue
+
+        raise TranscriptFetchError(video_id, "All transcript fetching methods failed")
+
+    def _fetch_with_whisper(self, video_id: str) -> tuple:
+        """Fetch using Whisper"""
+        return self.whisper_fetcher.fetch_transcript(video_id)
+
+    def _fetch_with_api(self, video_id: str) -> tuple:
+        """Fetch using transcript API without proxy"""
+        api = YouTubeTranscriptApi()
+        return self._fetch_transcript_api(api, video_id)
+
+    def _fetch_with_api_proxy(self, video_id: str) -> tuple:
+        """Fetch using transcript API with proxy"""
+        api = YouTubeTranscriptApi(proxy_config=self.proxy_config)
+        return self._fetch_transcript_api(api, video_id)
+
+    def _fetch_transcript_api(self, api: YouTubeTranscriptApi, video_id: str) -> tuple:
+        """Core API fetch logic"""
+        transcript_list = api.list(video_id)
+
+        try:
+            transcript = transcript_list.find_transcript(self.languages)
+        except:
+            available_langs = [t.language_code for t in transcript_list]
+            transcript = transcript_list.find_transcript(available_langs)
+
+        transcript_parts = transcript.fetch()
+        full_transcript = " ".join(chunk.text for chunk in transcript_parts)
+        language_code = transcript.language_code
+
+        language_name = self._get_language_name(language_code)
+        return full_transcript, language_name
+
+    def _get_language_name(self, language_code: str) -> str:
+        """Convert language code to language name"""
+        for name, code in LANGUAGE_MAP.items():
+            if code == language_code:
+                return name.split(" ")[0]
+        return language_code.upper()
 
 
 # ------------------------
@@ -198,10 +419,8 @@ class TranslationService(LoggerMixin):
         self.output_parser = StrOutputParser()
 
     def detect_language(self, text: str) -> str:
-        """Detect the language of the given text"""
         try:
             self.log_info("Detecting language...")
-
             prompt = PromptTemplate(
                 template="""Detect the language of the following text. Return ONLY the language name (e.g., "English", "Hindi", "Spanish", etc.):
 
@@ -210,13 +429,10 @@ Text: {text}
 Language:""",
                 input_variables=["text"],
             )
-
             chain = prompt | self.llm | self.output_parser
             language = chain.invoke({"text": text[:500]})
-
             self.log_info(f"Detected language: {language}")
             return language.strip()
-
         except Exception as e:
             self.log_error(e, {"text_length": len(text)})
             return "Unknown"
@@ -224,14 +440,12 @@ Language:""",
     def translate_text(
         self, text: str, target_language: str, source_language: str = None
     ) -> str:
-        """Translate text to target language"""
         try:
             if not source_language:
                 source_language = self.detect_language(text)
 
             self.log_info(f"Translating from {source_language} to {target_language}")
 
-            # For large texts, translate in chunks
             if len(text) > 4000:
                 return self._translate_large_text(
                     text, target_language, source_language
@@ -250,7 +464,6 @@ Language:""",
     def _translate_chunk(
         self, text: str, target_language: str, source_language: str
     ) -> str:
-        """Translate a single chunk of text"""
         prompt = PromptTemplate(
             template="""Translate the following text from {source_language} to {target_language}. 
 Maintain the original meaning, tone, and formatting. Return ONLY the translated text:
@@ -261,9 +474,8 @@ Original Text ({source_language}):
 Translated Text ({target_language}):""",
             input_variables=["text", "source_language", "target_language"],
         )
-
         chain = prompt | self.llm | self.output_parser
-        translated = chain.invoke(
+        return chain.invoke(
             {
                 "text": text,
                 "source_language": source_language,
@@ -271,17 +483,12 @@ Translated Text ({target_language}):""",
             }
         )
 
-        return translated
-
     def _translate_large_text(
         self, text: str, target_language: str, source_language: str
     ) -> str:
-        """Translate large text by splitting into chunks"""
         self.log_info(
             f"Large text detected ({len(text)} chars), splitting into chunks..."
         )
-
-        # Split into chunks of ~3000 characters (to stay within token limits)
         chunk_size = 3000
         chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
@@ -302,33 +509,23 @@ Translated Text ({target_language}):""",
 
 
 class YouTubeURLParser(LoggerMixin):
-    """Parser for YouTube URLs"""
-
     def extract_video_id(self, url: str) -> str:
-        """Extract video ID from YouTube URL"""
         context = {"url": url}
-
         try:
             self.log_info(f"Parsing YouTube URL: {url}")
-
             if not url:
                 raise VideoIDExtractionError(url, "URL is empty")
 
             video_id = None
-
-            # Method 1: youtube.com/watch?v=VIDEO_ID
             if "v=" in url:
                 video_id = url.split("v=")[-1].split("&")[0]
                 self.log_debug(f"Extracted video ID using 'v=' pattern: {video_id}")
-
-            # Method 2: youtu.be/VIDEO_ID
             elif "youtu.be/" in url:
                 video_id = url.split("youtu.be/")[-1].split("?")[0]
                 self.log_debug(
                     f"Extracted video ID using 'youtu.be/' pattern: {video_id}"
                 )
 
-            # Validate extracted ID
             if not video_id or len(video_id) != 11:
                 raise VideoIDExtractionError(
                     url, f"Invalid video ID format: {video_id}"
@@ -336,7 +533,6 @@ class YouTubeURLParser(LoggerMixin):
 
             self.log_info(f"Successfully extracted video ID: {video_id}")
             return video_id
-
         except VideoIDExtractionError:
             raise
         except Exception as e:
@@ -345,68 +541,23 @@ class YouTubeURLParser(LoggerMixin):
 
 
 class TranscriptFetcher(LoggerMixin):
-    """Fetches transcripts from YouTube videos"""
+    """Fetches transcripts from YouTube videos with failover support"""
 
-    def __init__(self, languages: List[str] = None):
+    def __init__(
+        self, languages: List[str] = None, proxy_config: Dict[str, str] = None
+    ):
         self.languages = languages or ["en", "hi"]
+        self.proxy_config = proxy_config
+        self.hybrid_fetcher = HybridTranscriptFetcher(
+            languages=self.languages, proxy_config=self.proxy_config
+        )
 
     def fetch_transcript(self, video_id: str) -> tuple:
-        """Fetch transcript for a YouTube video and return text with detected language"""
-        context = {"video_id": video_id, "languages": self.languages}
-
-        try:
-            self.log_info(f"Fetching transcript for video {video_id}")
-
-            # Get transcript list
-            transcript_list = YouTubeTranscriptApi().list(video_id)
-            self.log_debug(
-                f"Available transcripts: {[t.language_code for t in transcript_list]}"
-            )
-
-            # Find transcript in preferred languages
-            try:
-                transcript = transcript_list.find_transcript(self.languages)
-                self.log_info(f"Found transcript in {transcript.language_code}")
-            except Exception as e:
-                self.log_warning(
-                    f"Could not find transcript in {self.languages}, fetching first available"
-                )
-                available_langs = [t.language_code for t in transcript_list]
-                transcript = transcript_list.find_transcript(available_langs)
-
-            # Fetch and combine transcript
-            transcript_parts = transcript.fetch()
-            full_transcript = " ".join(chunk.text for chunk in transcript_parts)
-
-            # Get language name from language code
-            language_code = transcript.language_code
-            language_name = self._get_language_name(language_code)
-
-            self.log_info(
-                f"Successfully fetched transcript. Language: {language_name} ({language_code}), Length: {len(full_transcript)} characters"
-            )
-
-            return full_transcript, language_name
-
-        except TranscriptFetchError:
-            raise
-        except Exception as e:
-            self.log_error(e, context)
-            raise TranscriptFetchError(
-                video_id, f"Failed to fetch transcript: {str(e)}"
-            )
-
-    def _get_language_name(self, language_code: str) -> str:
-        """Convert language code to language name"""
-        for name, code in LANGUAGE_MAP.items():
-            if code == language_code:
-                return name.split(" ")[0]  # Remove emoji/script part
-        return language_code.upper()
+        """Fetch transcript using hybrid approach"""
+        return self.hybrid_fetcher.fetch_transcript(video_id)
 
 
 class TextChunker(LoggerMixin):
-    """Chunks text into smaller pieces for processing"""
-
     def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -416,15 +567,12 @@ class TextChunker(LoggerMixin):
         )
 
     def chunk_text(self, text: str) -> List[Any]:
-        """Split text into chunks"""
         context = {"text_length": len(text), "chunk_size": self.chunk_size}
-
         try:
             self.log_info(f"Chunking text of length {len(text)} characters")
             docs = self.splitter.create_documents([text])
             self.log_info(f"Created {len(docs)} chunks")
             return docs
-
         except Exception as e:
             self.log_error(e, context)
             raise YouTubeRAGException(
@@ -433,30 +581,23 @@ class TextChunker(LoggerMixin):
 
 
 class VectorStoreBuilder(LoggerMixin):
-    """Builds and manages vector store"""
-
     def __init__(self, embedding_model: str = "text-embedding-3-small"):
         self.embedding_model = embedding_model
         self.embeddings = OpenAIEmbeddings(model=embedding_model)
 
     def build_vectorstore(self, docs: List[Any]) -> FAISS:
-        """Build vector store from documents"""
         context = {"num_documents": len(docs), "embedding_model": self.embedding_model}
-
         try:
             self.log_info(f"Building vector store from {len(docs)} documents")
             vectorstore = FAISS.from_documents(docs, self.embeddings)
             self.log_info("Vector store created successfully")
             return vectorstore
-
         except Exception as e:
             self.log_error(e, context)
             raise EmbeddingError(f"Failed to build vector store: {str(e)}")
 
 
 class QuestionAnswerer(LoggerMixin):
-    """Handles question answering using RAG"""
-
     def __init__(self, model: str = "gpt-4o-mini", temperature: float = 0.2):
         self.model = model
         self.temperature = temperature
@@ -471,7 +612,6 @@ class QuestionAnswerer(LoggerMixin):
         response_language: str = "English",
         k: int = 4,
     ) -> str:
-        """Answer a question using RAG with language support"""
         context = {
             "question": question,
             "model": self.model,
@@ -487,7 +627,6 @@ class QuestionAnswerer(LoggerMixin):
             if vectorstore is None:
                 raise QueryError(question, "Vector store is not initialized")
 
-            # Translate question to English for better retrieval if needed
             search_question = question
             if response_language != "English":
                 self.log_info(f"Translating question to English for better search...")
@@ -495,13 +634,11 @@ class QuestionAnswerer(LoggerMixin):
                     question, "English", response_language
                 )
 
-            # Set up retriever
             retriever = vectorstore.as_retriever(
                 search_type="similarity",
                 search_kwargs={"k": k},
             )
 
-            # Create prompt template
             prompt = PromptTemplate(
                 template="""You are a helpful assistant. Answer the question based ONLY on the provided transcript context. 
 If the context is insufficient, just say you don't know.
@@ -518,7 +655,6 @@ Answer in {response_language}:""",
                 input_variables=["context", "question", "response_language"],
             )
 
-            # Retrieve relevant documents
             self.log_debug("Retrieving relevant documents...")
             docs = retriever.invoke(search_question)
             self.log_debug(f"Retrieved {len(docs)} documents")
@@ -526,11 +662,9 @@ Answer in {response_language}:""",
             if not docs:
                 return "I couldn't find relevant information in the video transcript to answer your question."
 
-            # Combine context
             context_text = "\n\n".join(doc.page_content for doc in docs)
             self.log_debug(f"Context length: {len(context_text)} characters")
 
-            # Create chain and get response
             self.log_debug("Invoking LLM chain...")
             chain = prompt | self.llm | self.output_parser
             response = chain.invoke(
@@ -554,17 +688,16 @@ Answer in {response_language}:""",
 class YouTubeRAGPipeline(LoggerMixin):
     """Main pipeline orchestrator"""
 
-    def __init__(self):
+    def __init__(self, proxy_config: Dict[str, str] = None):
         self.log_info("Initializing YouTubeRAGPipeline")
         self.url_parser = YouTubeURLParser()
-        self.transcript_fetcher = TranscriptFetcher()
+        self.transcript_fetcher = TranscriptFetcher(proxy_config=proxy_config)
         self.text_chunker = TextChunker()
         self.vector_store_builder = VectorStoreBuilder()
         self.qa_system = QuestionAnswerer()
         self.translation_service = TranslationService()
 
     def process_video(self, url: str, target_language: str = "English") -> tuple:
-        """Complete pipeline to process a YouTube video with language support"""
         pipeline_context = {
             "url": url,
             "target_language": target_language,
@@ -576,17 +709,14 @@ class YouTubeRAGPipeline(LoggerMixin):
                 f"Starting video processing pipeline for: {url} (Target language: {target_language})"
             )
 
-            # Step 1: Parse URL
             self.log_info("Step 1/6: Parsing URL")
             video_id = self.url_parser.extract_video_id(url)
 
-            # Step 2: Fetch transcript with language detection
             self.log_info("Step 2/6: Fetching transcript")
             transcript, detected_language = self.transcript_fetcher.fetch_transcript(
                 video_id
             )
 
-            # Step 3: Translate transcript if needed
             self.log_info("Step 3/6: Processing language")
             if (
                 target_language != "Auto-detect"
@@ -602,15 +732,12 @@ class YouTubeRAGPipeline(LoggerMixin):
                 target_language = detected_language
                 self.log_info(f"Using original language: {detected_language}")
 
-            # Step 4: Chunk text
             self.log_info("Step 4/6: Chunking text")
             docs = self.text_chunker.chunk_text(transcript)
 
-            # Step 5: Build vector store
             self.log_info("Step 5/6: Building vector store")
             vectorstore = self.vector_store_builder.build_vectorstore(docs)
 
-            # Step 6: Generate summary
             self.log_info("Step 6/6: Generating summary")
             summary = self.qa_system.answer_question(
                 vectorstore,
@@ -635,8 +762,6 @@ class YouTubeRAGPipeline(LoggerMixin):
 
 
 def handle_streamlit_errors(func):
-    """Decorator to handle errors in Streamlit functions"""
-
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
@@ -653,6 +778,33 @@ def handle_streamlit_errors(func):
 
 
 # ------------------------
+# Helper function to get proxy config
+# ------------------------
+
+
+def get_proxy_config() -> Optional[Dict[str, str]]:
+    """Get proxy configuration from environment variables"""
+    try:
+        proxy_url = os.getenv("PROXY_URL")
+        proxy_username = os.getenv("PROXY_USERNAME")
+        proxy_password = os.getenv("PROXY_PASSWORD")
+
+        if proxy_url and proxy_username and proxy_password:
+            proxy_config = {
+                "http": f"http://{proxy_username}:{proxy_password}@{proxy_url}",
+                "https": f"https://{proxy_username}:{proxy_password}@{proxy_url}",
+            }
+            logger.info(f"Using proxy: {proxy_url}")
+            return proxy_config
+        else:
+            logger.warning("No proxy configuration found. Will use direct connection.")
+            return None
+    except Exception as e:
+        logger.error(f"Error getting proxy config: {str(e)}")
+        return None
+
+
+# ------------------------
 # Streamlit UI
 # ------------------------
 
@@ -660,9 +812,9 @@ def handle_streamlit_errors(func):
 # Initialize pipeline
 @st.cache_resource
 def get_pipeline():
-    """Initialize and cache the YouTube RAG pipeline"""
     logger.info("Initializing YouTubeRAGPipeline")
-    return YouTubeRAGPipeline()
+    proxy_config = get_proxy_config()
+    return YouTubeRAGPipeline(proxy_config=proxy_config)
 
 
 # Check for OpenAI API key
@@ -731,7 +883,7 @@ with col2:
     response_language = st.selectbox(
         "💬 Response language:",
         list(LANGUAGE_MAP.keys()),
-        index=0,  # Default to English
+        index=0,
         key="response_language_select",
         help="Select the language for answers and summaries.",
     )
@@ -740,23 +892,19 @@ with col2:
 # Auto-process when URL changes
 @handle_streamlit_errors
 def process_video_url(video_url, target_language, response_language):
-    """Process video URL and update session state"""
     if video_url and video_url != st.session_state.last_processed_url:
         if not st.session_state.processing:
             st.session_state.processing = True
 
-            # Create placeholders for progress
             progress_bar = st.progress(0)
             status_text = st.empty()
 
             try:
-                # Process video
                 status_text.text("🔍 Starting video processing...")
                 progress_bar.progress(10)
 
                 logger.info(f"Processing video URL: {video_url}")
 
-                # Step by step with progress updates
                 status_text.text("🔍 Fetching transcript...")
                 progress_bar.progress(25)
 
@@ -779,7 +927,6 @@ def process_video_url(video_url, target_language, response_language):
                 progress_bar.progress(100)
                 status_text.text("✅ Processing complete!")
 
-                # Store results in session state
                 st.session_state.vectorstore = vectorstore
                 st.session_state.summary = summary
                 st.session_state.video_processed = True
@@ -790,7 +937,6 @@ def process_video_url(video_url, target_language, response_language):
                 st.session_state.response_language = response_language
                 st.session_state.processing = False
 
-                # Clear progress indicators
                 status_text.empty()
                 progress_bar.empty()
 
@@ -812,16 +958,13 @@ if video_url:
 if st.session_state.video_processed and st.session_state.summary:
     st.divider()
 
-    # Language Information
     st.info(
         f"📹 Original language: **{st.session_state.detected_language}** | Processed in: **{st.session_state.target_language}** | Responses in: **{st.session_state.response_language}**"
     )
 
-    # Summary Section
     with st.expander("📝 Video Summary", expanded=True):
         st.write(st.session_state.summary)
 
-        # Quick action buttons for the summary
         col1, col2, col3 = st.columns(3)
         with col1:
             if st.button("🔄 Regenerate Summary", key="regen_summary"):
@@ -884,12 +1027,10 @@ if st.session_state.video_processed and st.session_state.summary:
                         logger.error(f"Failed to create timeline: {str(e)}")
                         st.error(f"Failed to create timeline: {str(e)}")
 
-    # Question & Prompt Section
     st.divider()
     st.header("💬 Ask Questions or Write a Prompt")
     st.write("Ask anything about the video or provide a custom prompt for analysis!")
 
-    # Input method selection
     input_type = st.radio(
         "Choose input type:",
         ["❓ Specific Question", "📝 Custom Prompt"],
@@ -927,8 +1068,7 @@ if st.session_state.video_processed and st.session_state.summary:
                         logger.error(f"Failed to get answer: {str(e)}")
                         st.error(f"Failed to get answer: {str(e)}")
 
-    else:  # Custom Prompt
-        # Prompt templates
+    else:
         st.caption("Quick prompt templates:")
         prompt_templates = {
             "Detailed Analysis": "Analyze this video in depth. Discuss the main arguments, supporting evidence, and overall effectiveness of the presentation.",
@@ -974,7 +1114,6 @@ if st.session_state.video_processed and st.session_state.summary:
                         logger.error(f"Failed to process prompt: {str(e)}")
                         st.error(f"Failed to process prompt: {str(e)}")
 
-    # Additional Features Section
     st.divider()
     st.header("🔧 Additional Features")
 
@@ -1023,7 +1162,6 @@ if st.session_state.video_processed and st.session_state.summary:
     with col3:
         if st.button("🗑️ Process New Video", key="clear_btn"):
             logger.info("Clearing session state for new video")
-            # Clear session state
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
@@ -1034,7 +1172,6 @@ elif st.session_state.video_processed and not st.session_state.summary:
 elif not st.session_state.video_processed and not video_url:
     st.info("👆 Enter a YouTube URL above to get started!")
 
-# Footer
 st.divider()
 st.caption(
     "Built with Streamlit, LangChain, and OpenAI • Supports multiple languages • Automatically processes YouTube videos on URL input"
